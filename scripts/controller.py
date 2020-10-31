@@ -18,7 +18,8 @@ class ControllerNode:
     class FlightState(Enum):  # 飞行状态
         WAITING = 1
         NAVIGATING = 2
-        DETECTING_TARGET = 3
+        DETECTING_TARGET=3#搜寻着火源
+		DETECTING_OBJECT=5#搜寻小球
         LANDING = 4
 
     def __init__(self):
@@ -115,7 +116,7 @@ class ControllerNode:
                 return
 
             if self.detectTarget():
-                #rospy.loginfo('Target detected.')
+                rospy.loginfo('Target detected.')
                 # 根据无人机当前x坐标判断正确的窗口是哪一个
                 # 实际上可以结合目标在图像中的位置和相机内外参数得到标记点较准确的坐标，这需要相机成像的相关知识
                 # 此处仅仅是做了一个粗糙的估计
