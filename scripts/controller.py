@@ -13,27 +13,46 @@ from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge, CvBridgeError
 from json import load
+from tools import getPackagePath
+import time
 
 
 class ControllerNode:
     class FlightState(Enum):
-        WAITING = 1
-        NAVIGATING = 2
+        WAITING = 0
+        NAVIGATING = 1
         # Fire pos
-        DETECTING_TARGET = 3
+        DETECTING_TARGET = 2
         # Balls
-        DETECTING_OBJECT = 4
-        LANDING = 5
+        DETECTING_OBJECT = 3
+        LANDING = 4
 
     def __init__(self):
         rospy.init_node('controller_node', anonymous=True)
         rospy.logwarn('Controller node set up.')
 
+        # Loop rate
+        self.adjust_rate_ = 1
+        self.decide_rate_ = 0.3
+
         # The pose of drone in the world's coordinate system
         self.R_wu_ = R.from_quat([0, 0, 0, 1])
         self.t_wu_ = np.zeros([3], dtype=np.float64)
 
-        # For target detection
+        # For navigation
+        self.pid_Kp_ = 0.1
+        self.pid_Ki_ = 0.05
+        self.allowed_xy_diff_ = 20
+        self.allowed_z_diff_ = 10
+        self.allowed_yaw_diff_ = 5
+        self.flight_state_ = self.FlightState.WAITING
+        self.nav_nodes_ = None  # a list of 4-dimensional list[x,y,z,yaw]
+        self.next_nav_node_ = None
+        self.fixed_nav_routine_ = None
+        self.readRoutineFile()
+        self.next_state_ = None
+
+        # For detection
         self.bridge_ = CvBridge()
         self.image_ = None
         # Window positions
@@ -54,14 +73,6 @@ class ControllerNode:
         self.cam_diff_ = 0
         self.cam_height_ = self.t_wu_[2] + self.cam_diff_
 
-        # For navigation
-        self.flight_state_ = self.FlightState.WAITING
-        self.nav_nodes_ = None  # a list of 4-dimensional list[x,y,z,yaw]
-        self.next_nav_node_ = None
-        self.fixed_nav_routine_ = None
-        self.readRoutineFile()
-        self.next_state_ = None
-
         # Publications and subscriptions
         self.is_begin_ = False
         self.commandPub_ = rospy.Publisher(
@@ -78,17 +89,20 @@ class ControllerNode:
             '/tello/cmd_start', Bool, self.startcommandCallback)  # Receive start command
 
         # Main loop
-        rate = rospy.Rate(0.3)
+        rate = rospy.Rate(self.decide_rate_)
+        time.sleep(15)
         while not rospy.is_shutdown():
-            if self.is_begin_:
-                self.decide()
+            # if self.is_begin_:
+            self.decide()
             rate.sleep()
         rospy.logwarn('Controller node shut down.')
 
     def readRoutineFile(self):
-        self.fixed_nav_routine_ = load(open("./routine.json", "r"))
-        for routine_set in self.fixed_nav_routine_.values():
-            map(deque(), routine_set)
+        self.fixed_nav_routine_ = load(
+            open(getPackagePath('uav_sim') + "/scripts/routine.json", "r"))
+        for key in self.fixed_nav_routine_:
+            self.fixed_nav_routine_[key] = map(
+                deque, self.fixed_nav_routine_[key])
 
     # Updates
     def updateBallIndex(self):
@@ -100,50 +114,79 @@ class ControllerNode:
     def updateCamHeight(self):
         self.height_cam = self.t_wu_[2] + self.cam_diff_
 
-    def adjustZ(self):
-            # Adjust z coordinate
-            while True:
-                z_diff = self.next_nav_node_.nav_pos[2] - self.t_wu_[2]
-                if abs(z_diff) < 0.3:
-                    return True
+    def updateZDiff(self):
+        return 100 * (self.next_nav_node_[2] - self.t_wu_[2])
+
+    def updateRhoDiff(self):
+        delta_x = self.next_nav_node_[0] - self.t_wu_[0]
+        delta_y = self.next_nav_node_[1] - self.t_wu_[1]
+        if self.xy_forward_ and delta_x > 0:
+            return 100*(delta_x**2 + delta_y**2)**0.5
+        if self.xy_forward_ and delta_x < 0:
+            return -1*100*(delta_x**2 + delta_y**2)**0.5
+        if not self.xy_forward_ and delta_x < 0:
+            return -1*100*(delta_x**2 + delta_y**2)**0.5
+        if not self.xy_forward_ and delta_x > 0:
+            return 100*(delta_x**2 + delta_y**2)**0.5
+
+    def updateTransitionYaw(self):
+        yaw_diff = self.R_wu_.as_euler('zyx', degrees=True)[0] - math.atan2(self.next_nav_node_[1] - self.t_wu_[1],
+                                                                            self.next_nav_node_[0] - self.t_wu_[0]) / math.pi * 180
+        if abs(yaw_diff) > 180:
+            sig = -1 if yaw_diff > 0 else 1
+            yaw_diff += sig * 360
+        return yaw_diff
+
+    def updateYawDiff(self):
+        yaw_diff = self.R_wu_.as_euler('zyx', degrees=True)[
+            0] - self.next_nav_node_[3]
+        if abs(yaw_diff) > 180:
+            sig = -1 if yaw_diff > 0 else 1
+            yaw_diff += sig * 360
+        return yaw_diff
+
+    # Pid adjustment
+    def adjust(self, functors, allowed_diffs, commands):
+        adjust_dimension = len(functors)
+        integrals = [0 for _ in range(adjust_dimension)]
+        adjusted = False
+        while not adjusted:
+            adjusted = True
+            for i in range(adjust_dimension):
+                diff = functors[i]()
+                allowed_diff = allowed_diffs[i]
+                if abs(diff) < allowed_diff:
+                    continue
                 else:
-                    commands = ['up ', 'down ']
-                    command_index = 0 if z_diff > 0 else 1
+                    adjusted = False
+                    integrals[i] += diff
+                    adjustment = int(self.pid_Kp_*diff +
+                                     self.pid_Ki_*integrals[i])
+                    command_index = 0 if adjustment > 0 else 1
                     self.publishCommand(
-                        commands[command_index] + str(int(abs(100*z_diff))))
-                    return False
+                        commands[i][command_index] + str(abs(adjustment)))
+                rospy.Rate(self.adjust_rate_).sleep()
 
-    def adjustYaw(self, target_yaw):
-        while True:
-            yaw = self.R_wu_.as_euler('zyx', degrees=True)[0]
-            yaw_diff = yaw - target_yaw if yaw - \
-                target_yaw > 0 else yaw - target_yaw + 360
-            if abs(yaw_diff) < 10:
-                return True
-            else:
-                # clockwise and counterclockwise
-                command_str = 'cw %d' if yaw_diff > 0 else 'ccw %d'
-                self.publishCommand(command_str % (int(abs(yaw_diff))))
-                return False
-
-    def adjustXY(self):
+    def flyToNextNode(self):
+        # Calculate transition_yaw from the position now to the destination and adjust yaw
         # Fly to our destination on the x-y plane
-        while True:
-            delta_x = self.next_nav_node_.nav_pos[0] - self.t_wu_[0]
-            delta_y = self.next_nav_node_.nav_pos[1] - self.t_wu_[1]
-            rho_diff = int((delta_x**2 + delta_y**2)**0.5)
-            if abs(rho_diff) < 0.3:
-                return True
-            else:
-                commands = ['forward ', 'back ']
-                command_index = 0 if rho_diff > 0 else 1
-                self.publishCommand(
-                    commands[command_index] + str(int(abs(100*rho_diff))))
-                return False
+        self.xy_forward_ = (self.next_nav_node_[0] - self.t_wu_[0]) > 0
+        self.adjust([self.updateTransitionYaw, self.updateRhoDiff],
+                    [self.allowed_yaw_diff_, self.allowed_xy_diff_], [['cw ', 'ccw '], ['forward ', 'back ']])
+        # Adjust z coordinate
+        self.adjust([self.updateZDiff], [
+                    self.allowed_z_diff_], [['up ', 'down ']])
+        # Set our drone's yaw the same as the yaw of our next_nav_node_
+        self.adjust([self.updateYawDiff], [
+                    self.allowed_yaw_diff_], [['cw ', 'ccw ']])
 
     def switchNavigatingState(self):
         if len(self.nav_nodes_) == 0:
             self.flight_state_ = self.next_state_
+            info_vector = ["WAITING", "NAVIGATING",
+                           "DETECTING_TARGET", "DETECTING_OBJECT", "LANDING"]
+            rospy.logfatal(
+                "State change->{}".format(info_vector[self.flight_state_.value]))
         else:
             self.next_nav_node_ = self.nav_nodes_.popleft()
             self.flight_state_ = self.FlightState.NAVIGATING
@@ -194,13 +237,12 @@ class ControllerNode:
                 area_max_contour)  # 获取最小外接圆
             cv2.circle(image_copy, (int(centerX), int(centerY)),
                        int(rad), (0, 255, 0), 2)  # 画出圆心
-            win_dist = [abs(self.t_wu_[0]-win_x+0.5)
-                            for win_x in self.window_x_list_]
-            self.win_index_ = win_dist.index(min(win_dist))
             info_str = 'Target detected. Window index = %d' % self.win_index_
             rospy.logfatal(info_str)
         else:
             target = 'None'
+            info_str = 'Target didn\'t exist. Window index = %d' % self.win_index_
+            rospy.logfatal(info_str)
             pass
 
         self.image_result_pub_.publish(self.bridge_.cv2_to_imgmsg(image_copy))
@@ -270,24 +312,15 @@ class ControllerNode:
     def decide(self):
         if self.flight_state_ == self.FlightState.WAITING:
             self.publishCommand('takeoff')
+            time.sleep(15)
             self.win_index_ = 0
-            self.nav_nodes_ = self.fixed_nav_routine_["detect_window"][self.win_index_]
+            self.nav_nodes_ = self.fixed_nav_routine_[
+                "detect_window"][self.win_index_]
             self.next_state_ = self.FlightState.DETECTING_TARGET
             self.switchNavigatingState()
 
         elif self.flight_state_ == self.FlightState.NAVIGATING:
-            if not self.adjustZ():
-                return
-            # Calculate transition_yaw from the position now to the destination and adjust yaw
-            transition_yaw = math.atan2(self.next_nav_node_.nav_pos[1] - self.t_wu_[1],
-                                        self.next_nav_node_.nav_pos[0] - self.t_wu_[0]) / math.pi * 180
-            if not self.adjustYaw(transition_yaw):
-                return
-            if not self.adjustXY():
-                return
-            # Set our drone's yaw the same as the yaw of our next_nav_node_
-            if not self.adjustYaw(self.next_nav_node_.nav_yaw):
-                return
+            self.flyToNextNode()
             self.switchNavigatingState()
 
         elif self.flight_state_ == self.FlightState.DETECTING_TARGET:
@@ -295,15 +328,19 @@ class ControllerNode:
                 # Navigate to pos A
                 self.next_state_ = self.FlightState.DETECTING_OBJECT
                 self.updateBallIndex()
-                self.nav_nodes_ = self.fixed_nav_routine_["through_window"][self.win_index_]
-                self.switchNavigatingState()
+                self.nav_nodes_ = self.fixed_nav_routine_[
+                    "through_window"][self.win_index_]
             else:
                 if self.win_index_ >= 3:
                     rospy.loginfo('Detection failed, ready to land.')
-                    self.flight_state_ = self.FlightState.LANDING
+                    self.nav_nodes_ = None
+                    self.next_state_ = self.FlightState.LANDING
                 else:  # Continue detecting
                     self.win_index_ += 1
-                    self.nav_nodes_ = self.fixed_nav_routine_["detect_window"][self.win_index_]
+                    self.nav_nodes_ = self.fixed_nav_routine_[
+                        "detect_window"][self.win_index_]
+                    self.next_state_ = self.FlightState.DETECTING_TARGET
+            self.switchNavigatingState()
 
         elif self.flight_state_ == self.FlightState.DETECTING_OBJECT:
             self.detectObject()
@@ -319,7 +356,8 @@ class ControllerNode:
                 return
             self.updateBallIndex()
             self.next_state_ = self.FlightState.DETECTING_OBJECT
-            self.nav_nodes_ = self.fixed_nav_routine_["detect_ball"][self.ball_index_]
+            self.nav_nodes_ = self.fixed_nav_routine_[
+                "detect_ball"][self.ball_index_]
             self.switchNavigatingState()
 
         elif self.flight_state_ == self.FlightState.LANDING:
@@ -334,27 +372,34 @@ class ControllerNode:
         msg.data = command_str
         self.commandPub_.publish(msg)
         info_vector = ["WAITING", "NAVIGATING",
-            "DETECTING_TARGET", "DETECTING_OBJECT", "LANDING"]
-        rospy.logwarn("State: %s" % info_vector[self.flight_state_]
-        rospy.loginfo("Command: %s" % command_str)
+                       "DETECTING_TARGET", "DETECTING_OBJECT", "LANDING"]
+        rospy.logwarn("State: {}".format(
+            info_vector[self.flight_state_.value]))
+        rospy.loginfo("Command: " + command_str)
+        # Convert floats to ints
+        pose = list(map(lambda f: round(f, 2), self.t_wu_))
+        pose.append(int(self.R_wu_.as_euler('zyx', degrees=True)[0]))
+        rospy.loginfo("Drone pose: {}".format(pose))
+        rospy.loginfo("Next navigation node: {}".format(self.next_nav_node_))
         rospy.loginfo(
-            f"Drone pose: {self.t_wu_} yaw={self.R_wu_.as_euler('zyx', degrees=True)[0]}")
+            "Win_index = {} Ball_index = {} Answer = {}".format(self.win_index_, self.ball_index_, ''.join(self.ball_colors_)))
 
     def poseCallback(self, msg):
-        self.t_wu_=np.array(
+        self.t_wu_ = np.array(
             [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z])
-        self.R_wu_=R.from_quat(
+        self.R_wu_ = R.from_quat(
             [msg.pose.orientation.x, msg.pose.orientation.y, msg.pose.orientation.z, msg.pose.orientation.w])
         pass
 
     def imageCallback(self, msg):
         try:
-            self.image_=self.bridge_.imgmsg_to_cv2(msg, 'bgr8')
+            self.image_ = self.bridge_.imgmsg_to_cv2(msg, 'bgr8')
         except CvBridgeError as err:
             print(err)
 
     def startcommandCallback(self, msg):
-        self.is_begin_=msg.data
+        self.is_begin_ = msg.data
+
 
 if __name__ == '__main__':
-    controller=ControllerNode()
+    controller = ControllerNode()
