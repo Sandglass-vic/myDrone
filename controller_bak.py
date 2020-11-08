@@ -39,19 +39,21 @@ class ControllerNode:
         self.t_wu_ = np.zeros([3], dtype=np.float64)
 
         # For navigation
-        self.allowed_pos_error_ = 25
-        self.allowed_yaw_error_ = 10
-        self.max_pos_adjustment_ = 80
-        self.max_yaw_adjustment_ = 90
-        self.x_yaw_ = None
-        self.x_commands_ = None
-        self.y_yaw_ = None
-        self.y_commands_ = None
-        self.turning_point_ = 100
+        self.pid_Kp_ = 0.35
+        self.pid_Ki_ = 0.05
+        self.pid_Kd_ = 0.05
+        self.allowed_pos_diff_ = 30
+        self.allowed_yaw_diff_ = 10
+        self.max_pos_adjustment_ = 100
+        self.max_yaw_adjustment_ = 15
+        self.last_height_ = 1.5
         self.flight_state_ = self.FlightState.WAITING
-        self.nav_nodes_ = None  # a deque of list [x/y/z/yaw, number]
+        self.nav_nodes_ = None  # a deque of list [dimension, pos]
         self.next_nav_node_ = None
-        self.fixed_nav_route_ = None
+        self.fixed_nav_routine_ = None
+        self.routine_command_map_ = {"x": 0, "y": 1, "z": 2, "yaw": 3}
+        self.commands_matrix_ = [["right ", "left "], [
+            "forward ", "back "], ["up ", "down "], ["cw ", "ccw "]]
         self.readRoutineFile()
         self.next_state_ = None
 
@@ -96,11 +98,11 @@ class ControllerNode:
         rospy.logwarn('Controller node shut down.')
 
     def readRoutineFile(self):
-        self.fixed_nav_route_ = load(
-            open(getPackagePath('uav_sim') + "/scripts/route.json", "r"))
-        for key in self.fixed_nav_route_:
-            self.fixed_nav_route_[key] = map(
-                deque, self.fixed_nav_route_[key])
+        self.fixed_nav_routine_ = load(
+            open(getPackagePath('uav_sim') + "/scripts/routine.json", "r"))
+        for key in self.fixed_nav_routine_:
+            self.fixed_nav_routine_[key] = map(
+                deque, self.fixed_nav_routine_[key])
 
     # Updates
     def updateBallIndex(self):
@@ -112,66 +114,109 @@ class ControllerNode:
     def updateCamHeight(self):
         self.height_cam = self.t_wu_[2] + self.cam_diff_
 
-    def updatePositionError(self, dimension):
-        assert(dimension >= 0 and dimension <= 2)
-        return int(100 * (self.next_nav_node_[1] - self.t_wu_[dimension]))
+    def updatePosDiff(self):
+        return 100 * (self.next_nav_node_[1] - self.t_wu_[self.routine_command_map_[self.next_nav_node_[0]]])
 
-    def updateYawError(self, target_yaw):
-        yaw_error = self.R_wu_.as_euler('zyx', degrees=True)[
-            0] - target_yaw
-        if abs(yaw_error) > 180:
-            sig = -1 if yaw_error > 0 else 1
-            yaw_error += sig * 360
-        return int(yaw_error)
+    """ def updateRhoDiff(self):
+        delta_x = self.next_nav_node_[0] - self.t_wu_[0]
+        delta_y = self.next_nav_node_[1] - self.t_wu_[1]
+        if self.xy_forward_ and delta_x > 0:
+            return 100*(delta_x**2 + delta_y**2)**0.5
+        if self.xy_forward_ and delta_x < 0:
+            return -1*100*(delta_x**2 + delta_y**2)**0.5
+        if not self.xy_forward_ and delta_x < 0:
+            return -1*100*(delta_x**2 + delta_y**2)**0.5
+        if not self.xy_forward_ and delta_x > 0:
+            return 100*(delta_x**2 + delta_y**2)**0.5
 
-    # Adjustment
-    def adjustX(self):
-        dimension = 0
-        error = self.updatePositionError(dimension)
-        if abs(error) < self.allowed_pos_error_:
+    def updateTransitionYaw(self):
+        yaw_diff = self.R_wu_.as_euler('zyx', degrees=True)[0] - math.atan2(self.next_nav_node_[1] - self.t_wu_[1],
+                                                                            self.next_nav_node_[0] - self.t_wu_[0]) / math.pi * 180
+        if abs(yaw_diff) > 180:
+            sig = -1 if yaw_diff > 0 else 1
+            yaw_diff += sig * 360
+        return yaw_diff """
+
+    def update90YawDiff(self):
+        yaw_diff = self.R_wu_.as_euler('zyx', degrees=True)[
+            0] - 90
+        if abs(yaw_diff) > 180:
+            sig = -1 if yaw_diff > 0 else 1
+            yaw_diff += sig * 360
+        return yaw_diff
+
+    def updateTargetYawDiff(self):
+        yaw_diff = self.R_wu_.as_euler('zyx', degrees=True)[
+            0] - self.next_nav_node_[1]
+        if abs(yaw_diff) > 180:
+            sig = -1 if yaw_diff > 0 else 1
+            yaw_diff += sig * 360
+        return yaw_diff
+
+    # Pid adjustment
+    def resetHeight(self):
+        if self.next_nav_node_[0] == "z":
+            self.last_height_ = self.next_nav_node_[1]
             return True
-        else:
-            if not self.adjustYaw(self.x_yaw_):
-                return False
-            command_index = 0 if error > 0 else 1
-            self.publishCommand(
-                self.x_commands[command_index] + str(min(self.max_pos_adjustment_, abs(error))))
-            return False
-
-    def adjustY(self):
-        dimension = 1
-        error = self.updatePositionError(dimension)
-        if abs(error) < self.allowed_pos_error_:
+        info = "Reset height to {}".format(self.last_height_)
+        rospy.loginfo(info)
+        diff = self.t_wu_[2] - self.last_height_
+        if abs(diff) < self.allowed_pos_diff_:
             return True
-        else:
-            if not self.adjustYaw(self.y_yaw_):
-                return False
-            command_index = 0 if error > 0 else 1
-            self.publishCommand(
-                self.y_commands[command_index] + str(min(self.max_pos_adjustment_, abs(error))))
-            return False
-
-    def adjustZ(self):
-        dimension = 2
-        error = self.updatePositionError(dimension)
-        if abs(error) < self.allowed_pos_error_:
-            return True
-        else:
-            commands = ["up ", "down "]
-            command_index = 0 if error > 0 else 1
-            self.publishCommand(
-                commands[command_index] + str(min(self.max_pos_adjustment_, abs(error))))
-            return False
-
-    def adjustYaw(self, target_yaw):
-        yaw_error = self.updateYawError(target_yaw)
-        if abs(yaw_error) < self.allowed_yaw_error_:
-            return True
-        commands = ["cw ", "ccw "]
-        command_index = 0 if yaw_error > 0 else 1
+        adjustment = int(diff)
+        commands = self.commands_matrix_[2]
+        command_index = 0 if adjustment > 0 else 1
         self.publishCommand(
-            commands[command_index] + str(min(self.max_yaw_adjustment_, abs(yaw_error))))
+            commands[command_index] + str(min(self.max_pos_adjustment_, abs(adjustment))))
         return False
+
+    def resetYaw(self):
+        if self.next_nav_node_[0] == "yaw":
+            return True
+        yaw_diff = self.update90YawDiff()
+        if abs(yaw_diff) < self.allowed_yaw_diff_:
+            return True
+        adjustment = int(yaw_diff)
+        commands = self.commands_matrix_[3]
+        command_index = 0 if adjustment > 0 else 1
+        self.publishCommand(
+            commands[command_index] + str(min(self.max_yaw_adjustment_,abs(adjustment))))
+        return False
+
+    def adjustYaw(self):
+        yaw_diff = self.updateTargetYawDiff()
+        if abs(yaw_diff) < self.allowed_yaw_diff_:
+            return True
+        adjustment = int(yaw_diff)
+        commands = self.commands_matrix_[3]
+        command_index = 0 if adjustment > 0 else 1
+        self.publishCommand(
+            commands[command_index] + str(min(self.max_yaw_adjustment_,abs(adjustment))))
+        return False
+
+    def adjustPos(self):
+        self.resetHeight()
+        key = self.next_nav_node_[
+            0]
+        allowed_diff = self.allowed_pos_diff_
+        diff = self.updatePosDiff()
+        commands = self.commands_matrix_[self.routine_command_map_[key]]
+        if abs(diff) < allowed_diff:
+            return True
+        else:
+            self.integral_ += diff
+            delta_diff = self.last_diff_ - diff
+            self.last_diff = diff
+            adjustment = int(self.pid_Kp_*diff +
+                             self.pid_Ki_*self.integral_+self.pid_Kd_*delta_diff)
+            command_index = 0 if adjustment > 0 else 1
+            self.publishCommand(
+                commands[command_index] + str(min(self.max_pos_adjustment_,abs(adjustment))))
+            return False
+
+    def stop(self):
+        time.sleep(0.2)
+        self.publishCommand("stop")
 
     def switchNavigatingState(self):
         if self.nav_nodes_ == None or len(self.nav_nodes_) == 0:
@@ -183,42 +228,10 @@ class ControllerNode:
         else:
             self.next_nav_node_ = self.nav_nodes_.popleft()
             self.flight_state_ = self.FlightState.NAVIGATING
-            if self.next_nav_node_ != None and len(self.next_nav_node_) == 1:
-                self.publishCommand(self.next_nav_node_[0])
-                self.switchNavigatingState()
-            else:
-                # X axis
-                x_error = self.updatePositionError(0)
-                if abs(x_error) > self.turning_point_:
-                    if x_error > 0:
-                        self.x_yaw_ = 0
-                        self.x_commands = ["forward ", "back "]
-                    else:
-                        self.x_yaw_ = 180
-                        self.x_commands = ["back ", "forward "]
-                else:
-                    if x_error > 0:
-                        self.x_yaw_ = 90
-                        self.x_commands = ["right ", "left "]
-                    else:
-                        self.x_yaw_ = -90
-                        self.x_commands = ["left ", "right "]
-                # Y axis
-                y_error = self.updatePositionError(1)
-                if abs(y_error) > self.turning_point_:
-                    if y_error > 0:
-                        self.y_yaw_ = 90
-                        self.y_commands = ["forward ", "back "]
-                    else:
-                        self.y_yaw_ = -90
-                        self.y_commands = ["back ", "forward "]
-                else:
-                    if y_error > 0:
-                        self.y_yaw_ = 0
-                        self.y_commands = ["left ", "right "]  
-                    else:
-                        self.y_yaw_ = 180
-                        self.y_commands = ["right ", "left "]
+            self.resetYaw()
+        # For PID use
+        self.integral_ = 0
+        self.last_diff_ = 0
 
     # Detections
     def detectTarget(self):
@@ -238,7 +251,7 @@ class ControllerNode:
         frame = cv2.merge((h, s, v))  # 合并三个通道
 
         frame = cv2.inRange(frame, self.red_color_range_[
-            0], self.red_color_range_[1])  # 对原图像和掩模进行位运算
+                            0], self.red_color_range_[1])  # 对原图像和掩模进行位运算
         opened = cv2.morphologyEx(
             frame, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))  # 开运算
         closed = cv2.morphologyEx(
@@ -295,13 +308,13 @@ class ControllerNode:
 
         if color == "r":
             frame = cv2.inRange(frame, self.red_color_range_[
-                0], self.red_color_range_[1])
+                                0], self.red_color_range_[1])
         elif color == 'b':
             frame = cv2.inRange(frame, self.blue_color_range_[
-                0], self.blue_color_range_[1])
+                                0], self.blue_color_range_[1])
         else:
             frame = cv2.inRange(frame, self.yellow_color_range_[
-                0], self.yellow_color_range_[1])
+                                0], self.yellow_color_range_[1])
 
         opened = cv2.morphologyEx(
             frame, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))  # 开运算
@@ -343,24 +356,20 @@ class ControllerNode:
             self.publishCommand('takeoff')
             time.sleep(10)
             self.win_index_ = 0
-            self.nav_nodes_ = self.fixed_nav_route_[
+            self.nav_nodes_ = self.fixed_nav_routine_[
                 "detect_window"][self.win_index_]
             self.next_state_ = self.FlightState.DETECTING_TARGET
             self.switchNavigatingState()
 
         elif self.flight_state_ == self.FlightState.NAVIGATING:
-            if self.next_nav_node_[0] == 'x':
-                if not self.adjustX():
+            if self.next_nav_node_[0] == "yaw":
+                if not self.adjustYaw():
                     return
-            elif self.next_nav_node_[0] == 'y':
-                if not self.adjustY():
-                    return
-            elif self.next_nav_node_[0] == 'z':
-                if not self.adjustZ():
-                    return
-            elif self.next_nav_node_[0] == 'yaw':
-                if not self.adjustYaw(self.next_nav_node_[1]):
-                    return
+            elif self.next_nav_node_[0] != "stop":
+                if not self.adjustPos():
+                    return          
+            else:
+                self.stop()
             self.switchNavigatingState()
 
         elif self.flight_state_ == self.FlightState.DETECTING_TARGET:
@@ -368,7 +377,7 @@ class ControllerNode:
                 # Navigate to pos A
                 self.next_state_ = self.FlightState.DETECTING_OBJECT
                 self.updateBallIndex()
-                self.nav_nodes_ = self.fixed_nav_route_[
+                self.nav_nodes_ = self.fixed_nav_routine_[
                     "through_window"][self.win_index_]
             else:
                 if self.win_index_ >= 2:
@@ -377,7 +386,7 @@ class ControllerNode:
                     self.next_state_ = self.FlightState.LANDING
                 else:  # Continue detecting
                     self.win_index_ += 1
-                    self.nav_nodes_ = self.fixed_nav_route_[
+                    self.nav_nodes_ = self.fixed_nav_routine_[
                         "detect_window"][self.win_index_]
                     self.next_state_ = self.FlightState.DETECTING_TARGET
             self.switchNavigatingState()
@@ -385,18 +394,18 @@ class ControllerNode:
         elif self.flight_state_ == self.FlightState.DETECTING_OBJECT:
             self.detectObject()
             if self.ball_index_ == 4:
-                self.nav_nodes_ = self.fixed_nav_route_["normal_land"][0]
+                self.nav_nodes_ = self.fixed_nav_routine_["normal_land"][0]
                 self.next_state_ = self.FlightState.LANDING
                 self.switchNavigatingState()
                 return
             if self.detected_ball_num__ == 3 and self.ball_index_ == 3:
-                self.nav_nodes_ = self.fixed_nav_route_["pre_land"][0]
+                self.nav_nodes_ = self.fixed_nav_routine_["pre_land"][0]
                 self.next_state_ = self.FlightState.LANDING
                 self.switchNavigatingState()
                 return
             self.updateBallIndex()
             self.next_state_ = self.FlightState.DETECTING_OBJECT
-            self.nav_nodes_ = self.fixed_nav_route_[
+            self.nav_nodes_ = self.fixed_nav_routine_[
                 "detect_ball"][self.ball_index_]
             self.switchNavigatingState()
 

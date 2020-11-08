@@ -88,9 +88,9 @@ class telloControl:
         self.uav_target_pose_local_pub_ = rospy.Publisher('/mavros/setpoint_position/local', PoseStamped, queue_size=100)
 
         #在切换到offboard模式之前，必须先发送一些期望点信息到飞控中。 不然飞控会拒绝切换到offboard模式。
-        rate = rospy.Rate(20);
+        rate = rospy.Rate(20)
         for i in range(10):
-            self.uav_target_pose_local_pub_.publish(self.uav_target_pose_local_);
+            self.uav_target_pose_local_pub_.publish(self.uav_target_pose_local_)
             rate.sleep()
 
         try:
