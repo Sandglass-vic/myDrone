@@ -26,31 +26,32 @@ class ControllerNode:
         # Balls
         DETECTING_OBJECT = 3
         LANDING = 4
+        FINISHED = 5
 
     def __init__(self):
         rospy.init_node('controller_node', anonymous=True)
         rospy.logwarn('Controller node set up.')
 
         # Loop rate
-        self.decide_rate_ = 0.3
+        self.decide_rate_ = 2
 
         # The pose of drone in the world's coordinate system
         self.R_wu_ = R.from_quat([0, 0, 0, 1])
         self.t_wu_ = np.zeros([3], dtype=np.float64)
 
         # For navigation
-        self.allowed_pos_error_ = 25
+        self.allowed_pos_error_ = 20
+        self.allowed_reset_error_ = 40
         self.allowed_yaw_error_ = 10
-        self.max_pos_adjustment_ = 80
-        self.max_yaw_adjustment_ = 90
-        self.x_yaw_ = None
-        self.x_commands_ = None
-        self.y_yaw_ = None
-        self.y_commands_ = None
-        self.turning_point_ = 100
+        self.max_pos_adjustment_ = [30, 30, 50]
+        self.max_yaw_adjustment_ = 180
+        self.commands_= [["right ", "left "],["forward ", "back "],["up ","down "]]
+        self.dimension_yaw_ = [None,None,None]
+        self.turning_point_ = 125
         self.flight_state_ = self.FlightState.WAITING
         self.nav_nodes_ = None  # a deque of list [x/y/z/yaw, number]
         self.next_nav_node_ = None
+        self.next_nav_pos_ = [1.7, 1.1, 1.55]
         self.fixed_nav_route_ = None
         self.readRoutineFile()
         self.next_state_ = None
@@ -62,7 +63,7 @@ class ControllerNode:
         self.ball_index_ = -1
         # Answers
         self.detected_ball_num__ = 0
-        self.ball_colors_ = ['n', 'n', 'n', 'n', 'n']
+        self.ball_colors_ = ['n', 'e', 'n', 'n', 'n']
         # HSV range of balls
         self.red_color_range_ = ((0, 43, 46), (6, 255, 255))
         self.blue_color_range_ = ((100, 43, 46), (124, 255, 255))
@@ -86,13 +87,17 @@ class ControllerNode:
         self.startcmdSub_ = rospy.Subscriber(
             '/tello/cmd_start', Bool, self.startcommandCallback)  # Receive start command
 
-        # Main loop
         rate = rospy.Rate(self.decide_rate_)
         time.sleep(15)
         while not rospy.is_shutdown():
-            # if self.is_begin_:
             self.decide()
             rate.sleep()
+        # Main loop
+        '''rate = rospy.Rate(self.decide_rate_)
+        while not rospy.is_shutdown():
+            if self.is_begin_:
+                self.decide()
+            rate.sleep()'''
         rospy.logwarn('Controller node shut down.')
 
     def readRoutineFile(self):
@@ -104,10 +109,16 @@ class ControllerNode:
 
     # Updates
     def updateBallIndex(self):
-        if self.ball_index_ == 0:
-            self.ball_index_ += 2
+        if self.ball_index_ == -1:
+            self.ball_index_ = 2
+        elif self.ball_index_ == 2:
+            self.ball_index_ = 0
+        elif self.ball_index_ == 0:
+            self.ball_index_ = 3
+        elif self.ball_index_ == 3:
+            self.ball_index_ = 4
         else:
-            self.ball_index_ += 1
+            assert(False)
 
     def updateCamHeight(self):
         self.height_cam = self.t_wu_[2] + self.cam_diff_
@@ -125,31 +136,33 @@ class ControllerNode:
         return int(yaw_error)
 
     # Adjustment
-    def adjustX(self):
+    """ def adjustX(self):
         dimension = 0
         error = self.updatePositionError(dimension)
-        if abs(error) < self.allowed_pos_error_:
-            return True
-        else:
-            if not self.adjustYaw(self.x_yaw_):
+        if self.adjustZ():
+            if abs(error) < self.allowed_pos_error_:
+                return True
+            else:
+                if not self.adjustYaw(self.x_yaw_):
+                    return False
+                command_index = 0 if error > 0 else 1
+                self.publishCommand(
+                    self.x_commands[command_index] + str(min(self.max_pos_adjustment_[0], abs(error))))
                 return False
-            command_index = 0 if error > 0 else 1
-            self.publishCommand(
-                self.x_commands[command_index] + str(min(self.max_pos_adjustment_, abs(error))))
-            return False
 
     def adjustY(self):
         dimension = 1
         error = self.updatePositionError(dimension)
-        if abs(error) < self.allowed_pos_error_:
-            return True
-        else:
-            if not self.adjustYaw(self.y_yaw_):
+        if self.adjustZ():
+            if abs(error) < self.allowed_pos_error_:
+                return True
+            else:
+                if not self.adjustYaw(self.y_yaw_):
+                    return False
+                command_index = 0 if error > 0 else 1
+                self.publishCommand(
+                    self.y_commands[command_index] + str(min(self.max_pos_adjustment_[1], abs(error))))
                 return False
-            command_index = 0 if error > 0 else 1
-            self.publishCommand(
-                self.y_commands[command_index] + str(min(self.max_pos_adjustment_, abs(error))))
-            return False
 
     def adjustZ(self):
         dimension = 2
@@ -160,7 +173,33 @@ class ControllerNode:
             commands = ["up ", "down "]
             command_index = 0 if error > 0 else 1
             self.publishCommand(
-                commands[command_index] + str(min(self.max_pos_adjustment_, abs(error))))
+                commands[command_index] + str(min(self.max_pos_adjustment_[2], abs(error))))
+            return False """
+
+    def resetOthers(self, dimension):
+        if dimension != 2:
+            return True
+        error = self.updatePositionError(dimension)
+        if abs(error) > self.allowed_reset_error_:
+            command_index = 0 if error > 0 else 1
+            self.publishCommand(
+                self.commands_[dimension][command_index] + str(abs(error)))
+            return False
+        return True
+
+    def adjustPos(self, dimension):
+        dimension_set = {0, 1, 2} # x, y, z
+        dimension_set.remove(dimension)
+        for d in dimension_set:
+            if not self.resetOthers(d):
+                return False
+        error = self.updatePositionError(dimension)
+        if abs(error) < self.allowed_pos_error_:
+            return True
+        else:
+            command_index = 0 if error > 0 else 1
+            self.publishCommand(
+                self.commands_[dimension][command_index] + str(min(self.max_pos_adjustment_[dimension], abs(error))))
             return False
 
     def adjustYaw(self, target_yaw):
@@ -177,13 +216,13 @@ class ControllerNode:
         if self.nav_nodes_ == None or len(self.nav_nodes_) == 0:
             self.flight_state_ = self.next_state_
             info_vector = ["WAITING", "NAVIGATING",
-                           "DETECTING_TARGET", "DETECTING_OBJECT", "LANDING"]
+                           "DETECTING_TARGET", "DETECTING_OBJECT", "LANDING", "FINISHED"]
             rospy.logfatal(
                 "State change->{}".format(info_vector[self.flight_state_.value]))
         else:
             self.next_nav_node_ = self.nav_nodes_.popleft()
             self.flight_state_ = self.FlightState.NAVIGATING
-            if self.next_nav_node_ != None and len(self.next_nav_node_) == 1:
+            if len(self.next_nav_node_) == 1:
                 self.publishCommand(self.next_nav_node_[0])
                 self.switchNavigatingState()
             else:
@@ -191,34 +230,25 @@ class ControllerNode:
                 x_error = self.updatePositionError(0)
                 if abs(x_error) > self.turning_point_:
                     if x_error > 0:
-                        self.x_yaw_ = 0
-                        self.x_commands = ["forward ", "back "]
+                        self.dimension_yaw_[0] = 0
+                        self.commands_[0] = ["forward ", "back "]
                     else:
-                        self.x_yaw_ = 180
-                        self.x_commands = ["back ", "forward "]
+                        self.dimension_yaw_[0] = 180
+                        self.commands_[0] = ["back ", "forward "]
                 else:
-                    if x_error > 0:
-                        self.x_yaw_ = 90
-                        self.x_commands = ["right ", "left "]
-                    else:
-                        self.x_yaw_ = -90
-                        self.x_commands = ["left ", "right "]
+                    self.dimension_yaw_[0] = 90
+                    self.commands_[0] = ["right ", "left "]
                 # Y axis
                 y_error = self.updatePositionError(1)
-                if abs(y_error) > self.turning_point_:
-                    if y_error > 0:
-                        self.y_yaw_ = 90
-                        self.y_commands = ["forward ", "back "]
-                    else:
-                        self.y_yaw_ = -90
-                        self.y_commands = ["back ", "forward "]
+                if y_error > 0:
+                    self.dimension_yaw_[1] = 90
+                    self.commands_[1] = ["forward ", "back "]
                 else:
-                    if y_error > 0:
-                        self.y_yaw_ = 0
-                        self.y_commands = ["left ", "right "]  
-                    else:
-                        self.y_yaw_ = 180
-                        self.y_commands = ["right ", "left "]
+                    self.dimension_yaw_[1] = -90
+                    self.commands_[1] = ["back ", "forward "]
+                if self.next_nav_node_[0] != "yaw":
+                    self.next_nav_pos_[
+                    ord(self.next_nav_node_[0])-ord("x")] = self.next_nav_node_[1]
 
     # Detections
     def detectTarget(self):
@@ -320,7 +350,7 @@ class ControllerNode:
         return contour_area_max
 
     def detectObject(self):
-        # Detect the ball of index self.ball_index and store the result
+        # Detect the ball of index self.ball_index_ and store the result
         red_area = self.color_area('r')
         blue_area = self.color_area('b')
         yellow_area = self.color_area('y')
@@ -336,6 +366,8 @@ class ControllerNode:
             else:
                 color = 'b'
         self.ball_colors_[self.ball_index_] = color
+        info_str = 'Object detected. color = %s' % color
+        rospy.logfatal(info_str)
 
     # Main function
     def decide(self):
@@ -349,37 +381,27 @@ class ControllerNode:
             self.switchNavigatingState()
 
         elif self.flight_state_ == self.FlightState.NAVIGATING:
-            if self.next_nav_node_[0] == 'x':
-                if not self.adjustX():
-                    return
-            elif self.next_nav_node_[0] == 'y':
-                if not self.adjustY():
-                    return
-            elif self.next_nav_node_[0] == 'z':
-                if not self.adjustZ():
-                    return
-            elif self.next_nav_node_[0] == 'yaw':
+            if self.next_nav_node_[0] == 'yaw':
                 if not self.adjustYaw(self.next_nav_node_[1]):
+                    return
+            else:
+                if not self.adjustPos(ord(self.next_nav_node_[0]) - ord("x")):
                     return
             self.switchNavigatingState()
 
         elif self.flight_state_ == self.FlightState.DETECTING_TARGET:
-            if self.detectTarget():
+            if self.detectTarget() or self.win_index_ == 2:  # No need to detect
                 # Navigate to pos A
-                self.next_state_ = self.FlightState.DETECTING_OBJECT
                 self.updateBallIndex()
                 self.nav_nodes_ = self.fixed_nav_route_[
                     "through_window"][self.win_index_]
+                self.next_state_ = self.FlightState.DETECTING_OBJECT
             else:
-                if self.win_index_ >= 2:
-                    rospy.loginfo('Detection failed, ready to land.')
-                    self.nav_nodes_ = None
-                    self.next_state_ = self.FlightState.LANDING
-                else:  # Continue detecting
-                    self.win_index_ += 1
-                    self.nav_nodes_ = self.fixed_nav_route_[
-                        "detect_window"][self.win_index_]
-                    self.next_state_ = self.FlightState.DETECTING_TARGET
+                # Continue detecting
+                self.win_index_ += 1
+                self.nav_nodes_ = self.fixed_nav_route_[
+                    "detect_window"][self.win_index_]
+                self.next_state_ = self.FlightState.DETECTING_TARGET
             self.switchNavigatingState()
 
         elif self.flight_state_ == self.FlightState.DETECTING_OBJECT:
@@ -389,7 +411,7 @@ class ControllerNode:
                 self.next_state_ = self.FlightState.LANDING
                 self.switchNavigatingState()
                 return
-            if self.detected_ball_num__ == 3 and self.ball_index_ == 3:
+            elif self.detected_ball_num__ == 3:
                 self.nav_nodes_ = self.fixed_nav_route_["pre_land"][0]
                 self.next_state_ = self.FlightState.LANDING
                 self.switchNavigatingState()
@@ -397,12 +419,15 @@ class ControllerNode:
             self.updateBallIndex()
             self.next_state_ = self.FlightState.DETECTING_OBJECT
             self.nav_nodes_ = self.fixed_nav_route_[
-                "detect_ball"][self.ball_index_]
+                "detect_next_ball"][self.ball_index_]
             self.switchNavigatingState()
 
         elif self.flight_state_ == self.FlightState.LANDING:
-            self.answerPub_.publish(''.join(self.ball_colors_))
+            self.publishAnswer()
             self.publishCommand('land')
+            self.nav_nodes_ = None
+            self.next_state_ = self.FlightState.FINISHED
+            self.switchNavigatingState()
         else:
             pass
 
@@ -423,6 +448,17 @@ class ControllerNode:
         rospy.loginfo("Next navigation node: {}".format(self.next_nav_node_))
         rospy.loginfo(
             "Win_index = {} Ball_index = {} Answer = {}".format(self.win_index_, self.ball_index_, ''.join(self.ball_colors_)))
+
+    def publishAnswer(self):
+        if self.detected_ball_num__ == 2:
+            colors = {'r', 'b', 'y'}
+            for color in self.ball_colors_:
+                if color in colors:
+                    colors.remove(color)
+            self.ball_colors_[1] = colors.pop()
+        ans = ''.join(self.ball_colors_)
+        rospy.logfatal('Publish answer: ' + ans)
+        self.answerPub_.publish(ans)
 
     def poseCallback(self, msg):
         self.t_wu_ = np.array(
